@@ -5,6 +5,7 @@ Tests POST /beacon/join and GET /beacon/atlas endpoints.
 """
 import unittest
 import gc
+import hashlib
 import json
 import time
 import sys
@@ -18,6 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TestBeaconJoinRouting(unittest.TestCase):
     """Behavioral tests for beacon join routing endpoints."""
+
+    @staticmethod
+    def _agent_id(pubkey_hex):
+        clean = pubkey_hex[2:] if pubkey_hex.lower().startswith('0x') else pubkey_hex
+        return 'bcn_' + hashlib.sha256(bytes.fromhex(clean)).hexdigest()[:12]
 
     @classmethod
     def setUpClass(cls):
@@ -81,9 +87,11 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
     def test_join_register_new_agent(self):
         """POST /beacon/join registers a new agent successfully."""
+        pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        agent_id = self._agent_id(pubkey)
         payload = {
-            'agent_id': 'bcn_test_agent_001',
-            'pubkey_hex': '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+            'agent_id': agent_id,
+            'pubkey_hex': pubkey,
             'name': 'Test Agent',
         }
 
@@ -96,7 +104,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
         self.assertTrue(data['ok'])
-        self.assertEqual(data['agent_id'], 'bcn_test_agent_001')
+        self.assertEqual(data['agent_id'], agent_id)
         self.assertEqual(data['status'], 'active')
         self.assertIn('timestamp', data)
 
@@ -108,8 +116,9 @@ class TestBeaconJoinRouting(unittest.TestCase):
         pubkey_hex with a changed name updates the mutable field only.
         """
         pubkey = '0xaaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccdddd'
+        agent_id = self._agent_id(pubkey)
         payload1 = {
-            'agent_id': 'bcn_upsert_test',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Original Name',
         }
@@ -124,7 +133,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
         # Update mutable field only (name). pubkey_hex must stay the same.
         payload2 = {
-            'agent_id': 'bcn_upsert_test',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Updated Name',
         }
@@ -145,7 +154,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         with sqlite3.connect(self.test_db_path) as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM relay_agents WHERE agent_id = ?",
-                ('bcn_upsert_test',)
+                (agent_id,)
             ).fetchone()[0]
             self.assertEqual(count, 1)
 
@@ -156,9 +165,11 @@ class TestBeaconJoinRouting(unittest.TestCase):
         request with a victim's agent_id and their own public key must be
         rejected, not silently overwrite the victim's identity.
         """
+        victim_pubkey = '0x1111' + '00' * 30
+        agent_id = self._agent_id(victim_pubkey)
         payload1 = {
-            'agent_id': 'bcn_takeover_target',
-            'pubkey_hex': '0x1111' + '00' * 30,
+            'agent_id': agent_id,
+            'pubkey_hex': victim_pubkey,
             'name': 'Victim',
         }
         r1 = self.client.post(
@@ -170,7 +181,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
         # Attacker attempts takeover with different pubkey_hex
         payload2 = {
-            'agent_id': 'bcn_takeover_target',
+            'agent_id': agent_id,
             'pubkey_hex': '0x2222' + '00' * 30,
             'name': 'Attacker',
         }
@@ -179,16 +190,36 @@ class TestBeaconJoinRouting(unittest.TestCase):
             data=json.dumps(payload2),
             content_type='application/json',
         )
-        self.assertEqual(r2.status_code, 403)
+        self.assertEqual(r2.status_code, 400)
+        self.assertEqual(json.loads(r2.data)['error'], 'agent_id does not match pubkey_hex')
 
         # Verify pubkey was NOT overwritten
         with sqlite3.connect(self.test_db_path) as conn:
             row = conn.execute(
                 "SELECT pubkey_hex, name FROM relay_agents WHERE agent_id = ?",
-                ('bcn_takeover_target',)
+                (agent_id,)
             ).fetchone()
             self.assertEqual(row[0], payload1['pubkey_hex'])
             self.assertEqual(row[1], 'Victim')
+
+    def test_join_rejects_agent_id_pubkey_mismatch(self):
+        """POST /beacon/join must not allow arbitrary agent_id squatting."""
+        pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        expected = self._agent_id(pubkey)
+        response = self.client.post(
+            '/beacon/join',
+            data=json.dumps({
+                'agent_id': 'bcn_attacker_chosen',
+                'pubkey_hex': pubkey,
+                'name': 'Squatter',
+            }),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        data = json.loads(response.data)
+        self.assertEqual(data['error'], 'agent_id does not match pubkey_hex')
+        self.assertEqual(data['expected_agent_id'], expected)
 
     def test_join_invalid_pubkey_hex_returns_400(self):
         """POST /beacon/join returns 400 for invalid pubkey_hex."""
@@ -197,6 +228,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
             {'agent_id': 'bcn_test', 'pubkey_hex': '0xGGGG'},  # Invalid hex chars
             {'agent_id': 'bcn_test', 'pubkey_hex': ''},  # Empty
             {'agent_id': 'bcn_test', 'pubkey_hex': '0x'},  # Just prefix
+            {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234'},  # Too short
         ]
 
         for payload in invalid_cases:
@@ -296,13 +328,15 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
     def test_join_rejects_non_string_optional_fields(self):
         """POST /beacon/join returns 400 for structured optional string fields."""
+        pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        agent_id = self._agent_id(pubkey)
         cases = [
             (
-                {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234', 'name': {'display': 'agent'}},
+                {'agent_id': agent_id, 'pubkey_hex': pubkey, 'name': {'display': 'agent'}},
                 'Invalid name: must be a string',
             ),
             (
-                {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234', 'coinbase_address': ['0x123']},
+                {'agent_id': agent_id, 'pubkey_hex': pubkey, 'coinbase_address': ['0x123']},
                 'Invalid coinbase_address: must be a string',
             ),
         ]
@@ -320,9 +354,11 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
     def test_join_with_coinbase_address(self):
         """POST /beacon/join accepts valid coinbase_address."""
+        pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        agent_id = self._agent_id(pubkey)
         payload = {
-            'agent_id': 'bcn_wallet_test',
-            'pubkey_hex': '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+            'agent_id': agent_id,
+            'pubkey_hex': pubkey,
             'coinbase_address': '0x1234567890123456789012345678901234567890',
         }
 
@@ -338,17 +374,18 @@ class TestBeaconJoinRouting(unittest.TestCase):
         with sqlite3.connect(self.test_db_path) as conn:
             row = conn.execute(
                 "SELECT coinbase_address FROM relay_agents WHERE agent_id = ?",
-                ('bcn_wallet_test',)
+                (agent_id,)
             ).fetchone()
             self.assertEqual(row[0], '0x1234567890123456789012345678901234567890')
 
     def test_join_rejects_existing_agent_coinbase_address_change(self):
         """POST /beacon/join cannot overwrite payment address for an existing agent."""
         pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        agent_id = self._agent_id(pubkey)
         original_coinbase = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd'
         attacker_coinbase = '0x9999999999999999999999999999999999999999'
         payload1 = {
-            'agent_id': 'bcn_wallet_takeover_target',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Victim Agent',
             'coinbase_address': original_coinbase,
@@ -361,7 +398,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         self.assertEqual(response1.status_code, 200)
 
         payload2 = {
-            'agent_id': 'bcn_wallet_takeover_target',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Attacker Rename',
             'coinbase_address': attacker_coinbase,
@@ -376,7 +413,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         with sqlite3.connect(self.test_db_path) as conn:
             row = conn.execute(
                 "SELECT name, coinbase_address FROM relay_agents WHERE agent_id = ?",
-                ('bcn_wallet_takeover_target',)
+                (agent_id,)
             ).fetchone()
             self.assertEqual(row[0], 'Victim Agent')
             self.assertEqual(row[1], original_coinbase)
@@ -384,9 +421,10 @@ class TestBeaconJoinRouting(unittest.TestCase):
     def test_join_allows_idempotent_existing_coinbase_address(self):
         """POST /beacon/join accepts the same payment address for an existing agent."""
         pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+        agent_id = self._agent_id(pubkey)
         original_coinbase = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd'
         payload1 = {
-            'agent_id': 'bcn_wallet_idempotent',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Original Name',
             'coinbase_address': original_coinbase,
@@ -399,7 +437,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         self.assertEqual(response1.status_code, 200)
 
         payload2 = {
-            'agent_id': 'bcn_wallet_idempotent',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Updated Name',
             'coinbase_address': original_coinbase.upper().replace('X', 'x', 1),
@@ -414,7 +452,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         with sqlite3.connect(self.test_db_path) as conn:
             row = conn.execute(
                 "SELECT name, coinbase_address FROM relay_agents WHERE agent_id = ?",
-                ('bcn_wallet_idempotent',)
+                (agent_id,)
             ).fetchone()
             self.assertEqual(row[0], 'Updated Name')
             self.assertEqual(row[1], original_coinbase)
@@ -422,12 +460,14 @@ class TestBeaconJoinRouting(unittest.TestCase):
     def test_join_invalid_coinbase_address_returns_400(self):
         """POST /beacon/join returns 400 for invalid coinbase_address."""
         invalid_cases = [
-            {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234', 'coinbase_address': 'not-0x-prefixed'},
-            {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234', 'coinbase_address': '0xGGGG'},
-            {'agent_id': 'bcn_test', 'pubkey_hex': '0x1234', 'coinbase_address': '0x123'},  # Too short
+            {'coinbase_address': 'not-0x-prefixed'},
+            {'coinbase_address': '0xGGGG'},
+            {'coinbase_address': '0x123'},  # Too short
         ]
 
         for payload in invalid_cases:
+            pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
+            payload.update({'agent_id': self._agent_id(pubkey), 'pubkey_hex': pubkey})
             response = self.client.post(
                 '/beacon/join',
                 data=json.dumps(payload),
@@ -440,9 +480,10 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
     def test_join_pubkey_without_0x_prefix(self):
         """POST /beacon/join accepts pubkey_hex without 0x prefix."""
+        pubkey = 'aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344'
         payload = {
-            'agent_id': 'bcn_no_prefix',
-            'pubkey_hex': 'aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344',
+            'agent_id': self._agent_id(pubkey),
+            'pubkey_hex': pubkey,
         }
 
         response = self.client.post(
@@ -480,9 +521,11 @@ class TestBeaconJoinRouting(unittest.TestCase):
     def test_atlas_returns_registered_agents(self):
         """GET /beacon/atlas returns list of registered agents."""
         # Register two agents
+        alice_pubkey = '0xaaaa' + '00' * 30
+        bob_pubkey = '0xbbbb' + '00' * 30
         agents_data = [
-            {'agent_id': 'bcn_alice', 'pubkey_hex': '0xaaaa' + '00' * 30, 'name': 'Alice'},
-            {'agent_id': 'bcn_bob', 'pubkey_hex': '0xbbbb' + '00' * 30, 'name': 'Bob'},
+            {'agent_id': self._agent_id(alice_pubkey), 'pubkey_hex': alice_pubkey, 'name': 'Alice'},
+            {'agent_id': self._agent_id(bob_pubkey), 'pubkey_hex': bob_pubkey, 'name': 'Bob'},
         ]
 
         for agent in agents_data:
@@ -500,14 +543,15 @@ class TestBeaconJoinRouting(unittest.TestCase):
         self.assertEqual(len(data['agents']), 2)
 
         agent_ids = {a['agent_id'] for a in data['agents']}
-        self.assertIn('bcn_alice', agent_ids)
-        self.assertIn('bcn_bob', agent_ids)
+        self.assertIn(self._agent_id(alice_pubkey), agent_ids)
+        self.assertIn(self._agent_id(bob_pubkey), agent_ids)
 
     def test_atlas_agent_fields(self):
         """GET /beacon/atlas returns correct agent fields."""
+        pubkey = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'
         payload = {
-            'agent_id': 'bcn_fields_test',
-            'pubkey_hex': '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+            'agent_id': self._agent_id(pubkey),
+            'pubkey_hex': pubkey,
             'name': 'Fields Test Agent',
             'coinbase_address': '0x1234567890123456789012345678901234567890',
         }
@@ -524,7 +568,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
         data = json.loads(response.data)
         agent = data['agents'][0]
 
-        self.assertEqual(agent['agent_id'], 'bcn_fields_test')
+        self.assertEqual(agent['agent_id'], payload['agent_id'])
         self.assertEqual(agent['pubkey_hex'], payload['pubkey_hex'])
         self.assertEqual(agent['name'], 'Fields Test Agent')
         self.assertEqual(agent['status'], 'active')
@@ -588,10 +632,11 @@ class TestBeaconJoinRouting(unittest.TestCase):
         so the "update" step changes the name while keeping the same pubkey_hex.
         """
         pubkey = '0x1111' + '00' * 30
+        agent_id = self._agent_id(pubkey)
 
         # Step 1: Register agent
         payload1 = {
-            'agent_id': 'bcn_workflow',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Workflow Agent v1',
         }
@@ -612,7 +657,7 @@ class TestBeaconJoinRouting(unittest.TestCase):
 
         # Step 3: Update mutable field (name) — same pubkey_hex
         payload3 = {
-            'agent_id': 'bcn_workflow',
+            'agent_id': agent_id,
             'pubkey_hex': pubkey,
             'name': 'Workflow Agent v2',
         }

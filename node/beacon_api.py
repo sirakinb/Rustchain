@@ -71,6 +71,11 @@ def _coinbase_addresses_match(left, right):
     return (left or '').strip().casefold() == (right or '').strip().casefold()
 
 
+def _agent_id_from_pubkey_bytes(pubkey_bytes):
+    """Derive the canonical Beacon agent ID for an Ed25519 public key."""
+    return "bcn_" + hashlib.sha256(pubkey_bytes).hexdigest()[:12]
+
+
 def get_db():
     """Get database connection for current request context."""
     if 'db' not in g:
@@ -399,9 +404,17 @@ def beacon_join():
 
         try:
             # Validate it's proper hex
-            bytes.fromhex(pubkey_clean)
+            pubkey_bytes = bytes.fromhex(pubkey_clean)
         except ValueError:
             return jsonify({'error': 'Invalid pubkey_hex: must be valid hexadecimal string'}), 400
+        if len(pubkey_bytes) != 32:
+            return jsonify({'error': 'Invalid pubkey_hex: must be 32 bytes'}), 400
+        expected_agent_id = _agent_id_from_pubkey_bytes(pubkey_bytes)
+        if agent_id != expected_agent_id:
+            return jsonify({
+                'error': 'agent_id does not match pubkey_hex',
+                'expected_agent_id': expected_agent_id,
+            }), 400
 
         # Optional fields
         name = data.get('name')
